@@ -1,5 +1,6 @@
 <!--
-  AI 服务提供方选择：阿里云 DeepSeek（默认）/ Claude Opus 5.5（经 Oracle 中转）。
+  AI 服务提供方选择：阿里云 DeepSeek（默认）/ Claude Opus 5.5（经 Oracle 中转）/
+  自定义 OpenAI 兼容端点（地址 / Key / 模型名全部用户自填）。
 
   Claude 受 Anthropic 服务地区限制：挂载时经中转按出口 IP 检测，不可用则卡片置灰；
   已选 Claude 但地区不可用时 resolveModel 会静默回落 DeepSeek，这里给出提示。
@@ -42,17 +43,52 @@
           <i v-for="n in SPARK_COUNT" :key="n" :style="sparkStyle(n)" />
         </span>
       </button>
+
+      <button
+        type="button"
+        class="card card--custom"
+        :class="{ 'is-active': provider === 'custom' }"
+        @click="select('custom')"
+      >
+        <span class="card__title">自定义</span>
+        <span class="card__sub">OpenAI 兼容接口</span>
+      </button>
     </div>
 
     <n-text v-if="provider === 'claude' && region && !region.allowed" :depth="3" class="hint warn">
       当前地区暂不可用 Claude，AI 分析会自动使用 DeepSeek。
     </n-text>
-    <n-text v-else-if="!claudeAvailable && region" :depth="3" class="hint">
+    <n-text v-else-if="provider !== 'custom' && !claudeAvailable && region" :depth="3" class="hint">
       Claude 仅在 Anthropic 提供服务的地区可用（按当前网络出口判定）。
       <a class="recheck" @click="detect(true)">重新检测</a>
     </n-text>
 
-    <template v-if="provider === 'claude'">
+    <template v-if="provider === 'custom'">
+      <n-input
+        v-model:value="customBaseUrl"
+        placeholder="https://api.example.com/v1"
+        @blur="saveKey(CONFIG_KEYS.customBaseUrl, customBaseUrl)"
+      />
+      <n-text :depth="3" class="hint">
+        OpenAI 兼容 API 地址：填到 /v1 即可，自动补全 /chat/completions。
+      </n-text>
+      <n-input
+        v-model:value="customKey"
+        type="password"
+        show-password-on="click"
+        placeholder="该服务的 API Key（Bearer 鉴权）"
+        @blur="saveKey(CONFIG_KEYS.customApiKey, customKey)"
+      />
+      <n-input
+        v-model:value="customModel"
+        placeholder="模型名称，如 gpt-4o / deepseek-v3"
+        @blur="saveKey(CONFIG_KEYS.customModel, customModel)"
+      />
+      <n-text :depth="3" class="hint">
+        地址、Key、模型名三项都填写后，AI 分析会请求你自己的服务。
+      </n-text>
+    </template>
+    <template v-else-if="provider === 'claude'">
       <n-input
         v-model:value="anthropicKey"
         type="password"
@@ -98,6 +134,9 @@ const region = ref<ClaudeRegion | null>(null)
 const detecting = ref(false)
 const anthropicKey = ref('')
 const dashscopeKey = ref('')
+const customBaseUrl = ref('')
+const customKey = ref('')
+const customModel = ref('')
 const bursting = ref(false)
 const claudeCard = ref<HTMLElement | null>(null)
 
@@ -137,14 +176,20 @@ async function detect(force = false) {
 }
 
 onMounted(async () => {
-  const [p, ak, dk] = await Promise.all([
+  const [p, ak, dk, cb, ck, cm] = await Promise.all([
     getConfigByIpc<string>(CONFIG_KEYS.aiProvider).catch(() => undefined),
     getConfigByIpc<string>(CONFIG_KEYS.anthropicApiKey).catch(() => undefined),
-    getConfigByIpc<string>(CONFIG_KEYS.dashscopeApiKey).catch(() => undefined)
+    getConfigByIpc<string>(CONFIG_KEYS.dashscopeApiKey).catch(() => undefined),
+    getConfigByIpc<string>(CONFIG_KEYS.customBaseUrl).catch(() => undefined),
+    getConfigByIpc<string>(CONFIG_KEYS.customApiKey).catch(() => undefined),
+    getConfigByIpc<string>(CONFIG_KEYS.customModel).catch(() => undefined)
   ])
-  provider.value = p === 'claude' ? 'claude' : 'dashscope'
+  provider.value = p === 'claude' || p === 'custom' ? p : 'dashscope'
   if (typeof ak === 'string') anthropicKey.value = ak
   if (typeof dk === 'string') dashscopeKey.value = dk
+  if (typeof cb === 'string') customBaseUrl.value = cb
+  if (typeof ck === 'string') customKey.value = ck
+  if (typeof cm === 'string') customModel.value = cm
   await detect()
 })
 
@@ -160,7 +205,13 @@ async function select(next: AiProvider) {
     await putConfigByIpc(CONFIG_KEYS.aiProvider, next)
     provider.value = next
     if (next === 'claude') burst()
-    message.success(next === 'claude' ? '已切换到 Claude Opus 5.5' : '已切换到 DeepSeek')
+    message.success(
+      next === 'claude'
+        ? '已切换到 Claude Opus 5.5'
+        : next === 'custom'
+          ? '已切换到自定义接口'
+          : '已切换到 DeepSeek'
+    )
   } catch {
     message.error('保存失败')
   }
@@ -219,7 +270,7 @@ function trackPointer(e: PointerEvent) {
 
 .cards {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, 1fr);
   gap: var(--space-10);
 }
 
@@ -263,6 +314,12 @@ function trackPointer(e: PointerEvent) {
 }
 
 .card--ds.is-active {
+  border-color: var(--semantic-win);
+  box-shadow: 0 0 0 1px var(--semantic-win) inset;
+}
+
+/* ---- 自定义卡片：与 DeepSeek 卡片同款选中态，不用特效 ---- */
+.card--custom.is-active {
   border-color: var(--semantic-win);
   box-shadow: 0 0 0 1px var(--semantic-win) inset;
 }

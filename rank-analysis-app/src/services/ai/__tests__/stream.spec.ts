@@ -99,6 +99,46 @@ describe('requestAIContentStream provider 路由', () => {
   })
 })
 
+describe('requestAIContentStream custom 路由', () => {
+  it('provider 选 custom 时读 customApiKey / customBaseUrl 并透传 provider=custom', async () => {
+    const { invoke } = await import('@tauri-apps/api/core')
+    const { getConfigByIpc } = await import('../../ipc')
+    const mockInvoke = invoke as unknown as ReturnType<typeof vi.fn>
+    const mockGetConfig = getConfigByIpc as unknown as ReturnType<typeof vi.fn>
+    mockInvoke.mockReset()
+    mockInvoke.mockResolvedValue(undefined)
+    mockGetConfig.mockReset()
+    mockGetConfig.mockImplementation(async (key: string) =>
+      key === 'aiProvider'
+        ? 'custom'
+        : key === 'customApiKey'
+          ? 'sk-custom'
+          : key === 'customBaseUrl'
+            ? 'https://api.example.com/v1'
+            : undefined
+    )
+    const streamRequests = () =>
+      mockInvoke.mock.calls.filter(c => c[0] === 'stream_ai_analysis').map(c => c[1].request)
+
+    await requestAIContentStream('p', makeCallbacks(), 'sys', 'gpt-4o')
+    expect(streamRequests()[0]).toMatchObject({
+      provider: 'custom',
+      apiKey: 'sk-custom',
+      baseUrl: 'https://api.example.com/v1'
+    })
+
+    // 未填地址时 baseUrl 为 undefined（后端会报"未配置自定义 API 地址"）
+    mockGetConfig.mockImplementation(async (key: string) =>
+      key === 'aiProvider' ? 'custom' : undefined
+    )
+    await requestAIContentStream('p', makeCallbacks(), 'sys', 'gpt-4o')
+    expect(streamRequests()[1]).toMatchObject({ provider: 'custom', baseUrl: undefined })
+
+    mockGetConfig.mockReset()
+    mockGetConfig.mockResolvedValue(undefined)
+  })
+})
+
 describe('requestAIContentStream 终态恰好一次', () => {
   it('首个终态后忽略后续 done/error', async () => {
     const { invoke } = await import('@tauri-apps/api/core')

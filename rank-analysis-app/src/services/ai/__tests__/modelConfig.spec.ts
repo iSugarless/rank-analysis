@@ -97,6 +97,44 @@ describe('resolveModel with Claude provider', () => {
   })
 })
 
+describe('resolveModel with custom provider', () => {
+  beforeEach(() => {
+    mockInvoke.mockReset()
+    mockGetConfig.mockReset()
+    mockInvoke.mockResolvedValue({ schemaVersion: 1, models: { default: 'remote' } })
+  })
+
+  it('should use customModel from settings when provider is custom', async () => {
+    mockGetConfig.mockImplementation(async (key: string) =>
+      key === 'aiProvider' ? 'custom' : key === 'customModel' ? 'gpt-4o' : undefined
+    )
+    expect(await resolveModel('inGame', 'x')).toBe('gpt-4o')
+    // 场景参数对 custom 无意义：tagSuggest 也用同一个自定义模型
+    expect(await resolveModel('tagSuggest', 'x')).toBe('gpt-4o')
+  })
+
+  it('should trim customModel and fall back when unset', async () => {
+    mockGetConfig.mockImplementation(async (key: string) =>
+      key === 'aiProvider' ? 'custom' : key === 'customModel' ? '  deepseek-v3  ' : undefined
+    )
+    expect(await resolveModel('inGame', 'builtin')).toBe('deepseek-v3')
+
+    mockGetConfig.mockImplementation(async (key: string) =>
+      key === 'aiProvider' ? 'custom' : undefined
+    )
+    expect(await resolveModel('inGame', 'builtin')).toBe('builtin')
+  })
+
+  it('should not call region check or manifest when provider is custom', async () => {
+    mockGetConfig.mockImplementation(async (key: string) =>
+      key === 'aiProvider' ? 'custom' : key === 'customModel' ? 'm' : undefined
+    )
+    await resolveModel('inGame', 'x')
+    expect(mockInvoke).not.toHaveBeenCalledWith('get_ai_config', expect.anything())
+    expect(mockInvoke).not.toHaveBeenCalledWith('check_claude_region', expect.anything())
+  })
+})
+
 describe('prewarmAi', () => {
   const flush = () => new Promise(r => setTimeout(r, 0))
 

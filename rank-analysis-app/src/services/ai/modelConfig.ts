@@ -17,7 +17,7 @@ import { CONFIG_KEYS } from '../configKeys'
 export const DEFAULT_CLAUDE_MODEL = 'claude-opus-5-5'
 
 /** AI 服务提供方 */
-export type AiProvider = 'dashscope' | 'claude'
+export type AiProvider = 'dashscope' | 'claude' | 'custom'
 
 /** Rust `check_claude_region` 的返回 */
 export interface ClaudeRegion {
@@ -67,15 +67,19 @@ export function checkClaudeRegion(force = false): Promise<ClaudeRegion> {
     .catch(err => ({ country: null, allowed: false, error: String(err) }))
 }
 
-/** 用户选的 provider；读不到 / 非法值按 DashScope（同 loadConfig 包一层 then，同步抛错也兜住） */
-function loadProvider(): Promise<AiProvider> {
+/** 用户选的 provider；读不到 / 非法值按 DashScope（包一层 then，同步抛错也兜住）。
+ *  stream.ts 路由与 resolveModel 共用，保证两处对 aiProvider 的解读不会分叉。 */
+export function getSelectedProvider(): Promise<AiProvider> {
   return Promise.resolve()
     .then(() => getConfigByIpc<string>(CONFIG_KEYS.aiProvider))
     .then(
-      v => (v === 'claude' ? 'claude' : 'dashscope'),
+      v => (v === 'claude' || v === 'custom' ? v : ('dashscope' as const)),
       () => 'dashscope' as const
     )
 }
+
+/** 内部别名：保持原调用点不动 */
+const loadProvider = getSelectedProvider
 
 /**
  * 预热到 Claude 中转的连接（仅用户选了 Claude 时）：打开含 AI 入口的页面就先把连接建好，
@@ -92,7 +96,8 @@ export function prewarmAi(): void {
  * 解析某场景应使用的模型名
  * @param scene - AI 场景
  * @param fallback - IPC 失败时的内置默认模型
- * @returns 选 Claude 且区域可用：claudeModels 场景 > claudeModels.default > 内置 Claude 默认；
+ * @returns 选 custom：设置中的自定义模型名 > fallback（端点完全由用户自备）；
+ *          选 Claude 且区域可用：claudeModels 场景 > claudeModels.default > 内置 Claude 默认；
  *          否则：场景配置 > default 配置 > fallback
  * @example
  * ```ts
@@ -100,8 +105,17 @@ export function prewarmAi(): void {
  * ```
  */
 export async function resolveModel(scene: AiScene, fallback: string): Promise<string> {
-  const [config, provider] = await Promise.all([loadConfig(), loadProvider()])
-  const pick = (v: unknown) => (typeof v === 'string' && v ? v : undefined)
+  const pick = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : undefined)
+  const provider = await loadProvider()
+  if (provider === 'custom') {
+    // 自定义端点的模型名完全由用户在设置里填；未填时回落内置默认，
+    // 由用户自行保证端点上存在该模型（服务端会对未知模型报错并透出）
+    const custom = await Promise.resolve()
+      .then(() => getConfigByIpc<string>(CONFIG_KEYS.customModel))
+      .catch(() => undefined)
+    return pick(custom) ?? fallback
+  }
+  const config = await loadConfig()
   if (provider === 'claude' && (await checkClaudeRegion()).allowed) {
     const claude = config?.claudeModels
     const model = pick(claude?.[scene]) ?? pick(claude?.default)

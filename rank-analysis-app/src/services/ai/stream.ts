@@ -1,13 +1,13 @@
 /**
- * 经 Rust 命令 stream_ai_analysis 的流式 AI 请求（DashScope 直连 / Claude 走 Oracle 中转，
- * 按模型名前缀路由），以及基于 sessionStorage 的结果缓存包装
+ * 经 Rust 命令 stream_ai_analysis 的流式 AI 请求（DashScope 直连 / Claude 走 Oracle 中转 /
+ * custom 走用户自备的 OpenAI 兼容端点），以及基于 sessionStorage 的结果缓存包装
  */
 
 import { invoke, Channel } from '@tauri-apps/api/core'
 import { getConfigByIpc } from '../ipc'
 import { CONFIG_KEYS } from '../configKeys'
 import type { AIAnalysisResult, StreamCallbacks } from './types'
-import { isClaudeModel } from './modelConfig'
+import { getSelectedProvider, isClaudeModel } from './modelConfig'
 
 export const DEFAULT_SYSTEM_PROMPT =
   '你是一个LOL游戏分析师，擅长分析玩家战绩和给出游戏建议。请用简洁、专业、直接的中文回复。所有结论都必须绑定数据证据，避免空泛。'
@@ -59,13 +59,30 @@ export async function requestAIContentStream(
     fn()
   }
   try {
-    // provider 跟着模型名走（resolveModel 已按用户选择 + 区域检测给出模型），两者不会错配。
-    // 用户覆盖 key（设置里可填）；DashScope 空则后端走 env / 编译期注入，Claude 空则用中转内置 key
-    const claude = isClaudeModel(model)
-    const override =
-      (await getConfigByIpc<string>(
-        claude ? CONFIG_KEYS.anthropicApiKey : CONFIG_KEYS.dashscopeApiKey
-      )) || undefined
+    // 用户在设置里选的 provider 决定路由；claude 仍用模型名前缀交叉校验——
+    // 区域不可用时 resolveModel 已回落 dashscope 模型，此时不能按 aiProvider 走 claude。
+    // custom 的 key / 地址都来自设置（用户自备），其余同旧逻辑（DashScope 空则后端走
+    // env / 编译期注入，Claude 空则用中转内置 key）。
+    const selected = await getSelectedProvider()
+    const claude = selected !== 'custom' && isClaudeModel(model)
+    const isCustom = selected === 'custom'
+    const key = await Promise.resolve()
+      .then(() =>
+        getConfigByIpc<string>(
+          isCustom
+            ? CONFIG_KEYS.customApiKey
+            : claude
+              ? CONFIG_KEYS.anthropicApiKey
+              : CONFIG_KEYS.dashscopeApiKey
+        )
+      )
+      .catch(() => undefined)
+    const override = key || undefined
+    const baseUrl = isCustom
+      ? (await Promise.resolve()
+          .then(() => getConfigByIpc<string>(CONFIG_KEYS.customBaseUrl))
+          .catch(() => undefined)) || undefined
+      : undefined
 
     // 终态回调（onDone/onError）经 settle 包裹，保证恰好触发一次；分发统一走
     // mapStreamEvent，避免 done/error 逻辑与兜底文案在两处重复。
@@ -84,7 +101,8 @@ export async function requestAIContentStream(
         model,
         apiKey: override,
         responseFormat: opts.jsonMode ? 'json_object' : undefined,
-        provider: claude ? 'claude' : 'dashscope'
+        provider: isCustom ? 'custom' : claude ? 'claude' : 'dashscope',
+        baseUrl
       },
       onEvent: channel
     })

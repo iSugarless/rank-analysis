@@ -81,4 +81,36 @@ describe('AiProviderPicker', () => {
     const wrapper = await mountWithRegion({ country: 'HK', allowed: false }, 'claude')
     expect(wrapper.text()).toContain('自动使用 DeepSeek')
   })
+
+  it('should save custom provider and show its inputs when custom card clicked', async () => {
+    const wrapper = await mountWithRegion({ country: 'CN', allowed: false })
+
+    const custom = wrapper.find('.card--custom')
+    expect(custom.exists()).toBe(true)
+    await custom.trigger('click')
+    await flushPromises()
+
+    expect(mockPutConfig).toHaveBeenCalledWith('aiProvider', 'custom')
+    expect(custom.classes()).toContain('is-active')
+    expect(wrapper.text()).toContain('OpenAI 兼容 API 地址')
+  })
+
+  it('should restore custom inputs from saved config', async () => {
+    mockGetConfig.mockImplementation(async (key: string) => {
+      if (key === 'aiProvider') return 'custom'
+      if (key === 'customBaseUrl') return 'https://api.example.com/v1'
+      if (key === 'customApiKey') return 'sk-custom'
+      if (key === 'customModel') return 'gpt-4o'
+      return undefined
+    })
+    mockInvoke.mockResolvedValue({ country: 'CN', allowed: false, error: null })
+    const wrapper = mount(AiProviderPicker, { global: { plugins: [naive] } })
+    await flushPromises()
+
+    expect(wrapper.find('.card--custom').classes()).toContain('is-active')
+    const inputs = wrapper.findAll('input').map(i => (i.element as HTMLInputElement).value)
+    expect(inputs).toContain('https://api.example.com/v1')
+    expect(inputs).toContain('sk-custom')
+    expect(inputs).toContain('gpt-4o')
+  })
 })

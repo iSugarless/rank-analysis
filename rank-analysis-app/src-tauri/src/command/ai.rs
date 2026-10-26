@@ -9,6 +9,9 @@
 //! - **Claude**: 经 Oracle 中转（`relay/claude-relay`）。客户端不内置 Anthropic key，
 //!   中转按出口 IP 做区域门控（见 [`check_claude_region`]），并把 Anthropic 流转成与
 //!   DashScope 相同的 SSE 行格式，故两者共用同一套流解析
+//! - **Custom**: 用户自定义 OpenAI 兼容端点（设置中自填 API 地址 / Key / 模型名），
+//!   走与 DashScope 相同的 OpenAI 协议与 SSE 解析，但不带 DashScope 私有字段
+//!   `enable_thinking`（严格 OpenAI 端点会拒绝未知字段）
 //!
 //! ## 使用示例
 //!
@@ -74,22 +77,37 @@ fn http_client() -> &'static reqwest::Client {
 enum Provider {
     DashScope,
     Claude,
+    /// 用户自定义 OpenAI 兼容端点：设置中自填 API 地址 / Key / 模型名
+    Custom,
 }
 
 impl Provider {
-    /// 前端传 `"claude"` 走 Claude，其余（含缺省）都走 DashScope，老前端不受影响
+    /// 前端传 `"claude"` 走 Claude、`"custom"` 走自定义端点，
+    /// 其余（含缺省）都走 DashScope，老前端不受影响
     fn parse(s: Option<&str>) -> Self {
         match s {
             Some("claude") => Provider::Claude,
+            Some("custom") => Provider::Custom,
             _ => Provider::DashScope,
         }
     }
 
-    /// 总请求超时。Opus 5.5 思考恒开、输出也更长，60s 会截断长复盘
+    /// 总请求超时。Opus 5.5 思考恒开、输出也更长，60s 会截断长复盘；
+    /// 自定义端点可能是本地推理（Ollama 等），出字慢、输出长，给足余量
     fn request_timeout(self) -> Duration {
         Duration::from_secs(match self {
             Provider::DashScope => REQUEST_TIMEOUT_SECS,
             Provider::Claude => 180,
+            Provider::Custom => 600,
+        })
+    }
+
+    /// 首字看门狗时长。本地推理冷启动要先把模型权重载进显存/内存，
+    /// 首 token 可能远超 20s，custom 单独放宽；其余 provider 维持默认
+    fn first_token_timeout(self) -> Duration {
+        Duration::from_secs(match self {
+            Provider::Custom => 120,
+            _ => FIRST_TOKEN_TIMEOUT_SECS,
         })
     }
 }
@@ -176,19 +194,22 @@ const FIRST_TOKEN_TIMEOUT_SECS: u64 = 20;
 /// 首块到达前的最大尝试次数（含首次）。仅在"流尚未开始"时重试，避免重复输出。
 const MAX_ATTEMPTS: u32 = 2;
 
-/// 构建 DashScope chat 请求体。纯函数，便于单测。
+/// 构建 DashScope / 自定义端点的 OpenAI 兼容 chat 请求体。纯函数，便于单测。
 ///
 /// `response_format` 为 `Some` 时附加 OpenAI 兼容的 `response_format: {"type": ...}`
 /// 字段（如 `json_object` 强制 JSON 输出）；`None` 时不带该字段，保持普通文本输出。
 ///
-/// 恒带 `enable_thinking: false`：deepseek-v4.1 / qwen3.8 等混合思考模型默认先吐一段
-/// reasoning_content（实测），而 `extract_delta_content` 只转发 content，用户会干等
-/// 推理结束才见首字。非混合模型（如 qwen-flash）DashScope 忽略该字段。
+/// `disable_thinking` 为 true 时恒带 `enable_thinking: false`：deepseek-v4.1 / qwen3.8
+/// 等混合思考模型默认先吐一段 reasoning_content（实测），而 `extract_delta_content`
+/// 只转发 content，用户会干等推理结束才见首字。非混合模型（如 qwen-flash）
+/// DashScope 忽略该字段。自定义端点走严格的 OpenAI 协议（OpenAI 官方对未知字段报
+/// 400），故 custom 必须传 false 不带此字段。
 fn build_request_body(
     model: &str,
     system_prompt: &str,
     user_prompt: &str,
     response_format: Option<&str>,
+    disable_thinking: bool,
 ) -> serde_json::Value {
     let mut body = json!({
         "model": model,
@@ -196,13 +217,36 @@ fn build_request_body(
             { "role": "system", "content": system_prompt },
             { "role": "user", "content": user_prompt }
         ],
-        "stream": true,
-        "enable_thinking": false
+        "stream": true
     });
+    if disable_thinking {
+        body["enable_thinking"] = json!(false);
+    }
     if let Some(fmt) = response_format {
         body["response_format"] = json!({ "type": fmt });
     }
     body
+}
+
+/// 解析自定义端点的完整请求 URL。纯函数，便于单测。
+///
+/// 用户只需填到 `/v1`（如 `https://api.example.com/v1`）：末尾 `/` 会被去掉，
+/// 未以 `/chat/completions` 结尾则自动补全；填完整地址也兼容。必须以
+/// `http(s)://` 开头，否则 reqwest 会直接拒绝该 URL。
+fn custom_endpoint(base: Option<&str>) -> Result<String, String> {
+    let base = base
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "未配置自定义 API 地址（请在设置中填写）".to_string())?;
+    if !base.starts_with("http://") && !base.starts_with("https://") {
+        return Err("自定义 API 地址需以 http:// 或 https:// 开头".to_string());
+    }
+    let base = base.trim_end_matches('/');
+    if base.ends_with("/chat/completions") {
+        Ok(base.to_string())
+    } else {
+        Ok(format!("{}/chat/completions", base))
+    }
 }
 
 /// 构建 Claude 中转请求体（中转接口见 `relay/claude-relay/server.py`）。纯函数，便于单测。
@@ -252,8 +296,12 @@ pub struct AiStreamRequest {
     /// OpenAI 兼容 `response_format.type`（如 `json_object`，强制模型输出合法 JSON）。
     /// 缺省不传该字段（普通文本/markdown 输出）。Claude 下转为中转的 `jsonMode`。
     pub response_format: Option<String>,
-    /// `"claude"` 走 Claude 中转；缺省 / 其他值走 DashScope
+    /// `"claude"` 走 Claude 中转；`"custom"` 走自定义 OpenAI 兼容端点；
+    /// 缺省 / 其他值走 DashScope
     pub provider: Option<String>,
+    /// 自定义端点地址（provider=custom 时必填）：填到 `/v1` 即可，
+    /// 后端自动补全 `/chat/completions`；其余 provider 忽略
+    pub base_url: Option<String>,
 }
 
 /// AI 流式响应事件
@@ -321,8 +369,50 @@ pub async fn stream_ai_analysis(
                 &system_prompt,
                 &request.prompt,
                 request.response_format.as_deref(),
+                true,
             );
             (DASHSCOPE_URL.to_string(), body)
+        }
+        Provider::Custom => {
+            // 自定义端点：地址与 Key 都来自设置页（用户自备），环境变量 / 编译期注入不参与
+            let url = match custom_endpoint(request.base_url.as_deref()) {
+                Ok(u) => u,
+                Err(e) => {
+                    let _ = on_event.send(AiStreamEvent {
+                        event: "error".to_string(),
+                        data: Some(e),
+                    });
+                    return Ok(());
+                }
+            };
+            let key = match request
+                .api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+            {
+                Some(k) => k.to_string(),
+                None => {
+                    let _ = on_event.send(AiStreamEvent {
+                        event: "error".to_string(),
+                        data: Some("未配置自定义 API Key（请在设置中填写）".to_string()),
+                    });
+                    return Ok(());
+                }
+            };
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {}", key))
+                    .map_err(|e| format!("Invalid API key: {}", e))?,
+            );
+            let body = build_request_body(
+                &model,
+                &system_prompt,
+                &request.prompt,
+                request.response_format.as_deref(),
+                false,
+            );
+            (url, body)
         }
         Provider::Claude => {
             headers.insert(
@@ -361,6 +451,8 @@ pub async fn stream_ai_analysis(
     };
 
     let client = http_client();
+    // 首字看门狗按时长参数化：custom 可能是本地推理，冷启动 + 首 token 都慢
+    let first_token_timeout = provider.first_token_timeout();
 
     use futures::StreamExt;
 
@@ -418,8 +510,7 @@ pub async fn stream_ai_analysis(
 
             // 首字看门狗：等首个响应字节，超时 / 流即报错 / 空流都判这次尝试失败
             let mut s = response.bytes_stream();
-            match tokio::time::timeout(Duration::from_secs(FIRST_TOKEN_TIMEOUT_SECS), s.next())
-                .await
+            match tokio::time::timeout(first_token_timeout, s.next()).await
             {
                 Ok(Some(Ok(bytes))) => break (s, bytes),
                 _ => {
@@ -431,7 +522,7 @@ pub async fn stream_ai_analysis(
                         event: "error".to_string(),
                         data: Some(format!(
                             "首响应超时或为空（{}s 内无数据）",
-                            FIRST_TOKEN_TIMEOUT_SECS
+                            first_token_timeout.as_secs()
                         )),
                     });
                     return Ok(());
@@ -644,7 +735,7 @@ mod tests {
 
     #[test]
     fn body_omits_response_format_by_default() {
-        let body = build_request_body("qwen-flash", "sys", "user", None);
+        let body = build_request_body("qwen-flash", "sys", "user", None, true);
         assert!(body.get("response_format").is_none());
         assert_eq!(body["model"], "qwen-flash");
         assert_eq!(body["stream"], true);
@@ -653,15 +744,18 @@ mod tests {
     }
 
     #[test]
-    fn body_always_disables_thinking() {
-        // 混合思考模型不关思考会先输出整段推理，首字延迟成倍增加
-        let body = build_request_body("deepseek-v4.1-flash-1017", "sys", "user", None);
-        assert_eq!(body["enable_thinking"], false);
+    fn body_disables_thinking_only_when_requested() {
+        // DashScope：混合思考模型不关思考会先输出整段推理，首字延迟成倍增加
+        let ds = build_request_body("deepseek-v4.1-flash-1017", "sys", "user", None, true);
+        assert_eq!(ds["enable_thinking"], false);
+        // custom：严格的 OpenAI 协议端点对未知字段报 400，不能带 enable_thinking
+        let custom = build_request_body("gpt-4o", "sys", "user", None, false);
+        assert!(custom.get("enable_thinking").is_none());
     }
 
     #[test]
     fn body_includes_response_format_when_requested() {
-        let body = build_request_body("qwen-flash", "sys", "user", Some("json_object"));
+        let body = build_request_body("qwen-flash", "sys", "user", Some("json_object"), true);
         assert_eq!(body["response_format"]["type"], "json_object");
     }
 
@@ -674,9 +768,44 @@ mod tests {
     #[test]
     fn provider_parse_defaults_to_dashscope() {
         assert_eq!(Provider::parse(Some("claude")), Provider::Claude);
+        assert_eq!(Provider::parse(Some("custom")), Provider::Custom);
         assert_eq!(Provider::parse(Some("dashscope")), Provider::DashScope);
         assert_eq!(Provider::parse(None), Provider::DashScope);
         assert_eq!(Provider::parse(Some("whatever")), Provider::DashScope);
+    }
+
+    #[test]
+    fn custom_endpoint_appends_path_and_tolerates_trailing_slash() {
+        // 只填到 /v1：自动补全 chat/completions
+        assert_eq!(
+            custom_endpoint(Some("https://api.example.com/v1")).unwrap(),
+            "https://api.example.com/v1/chat/completions"
+        );
+        // 带尾随斜杠 / 填完整地址：都能用
+        assert_eq!(
+            custom_endpoint(Some("https://api.example.com/v1/")).unwrap(),
+            "https://api.example.com/v1/chat/completions"
+        );
+        assert_eq!(
+            custom_endpoint(Some("http://127.0.0.1:11434/v1/chat/completions")).unwrap(),
+            "http://127.0.0.1:11434/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn custom_endpoint_rejects_missing_or_bad_url() {
+        assert!(custom_endpoint(None).is_err());
+        assert!(custom_endpoint(Some("")).is_err());
+        assert!(custom_endpoint(Some("  ")).is_err());
+        // 必须带协议，否则 reqwest 拒绝该 URL
+        assert!(custom_endpoint(Some("api.example.com/v1")).is_err());
+    }
+
+    #[test]
+    fn custom_provider_has_relaxed_timeouts_for_local_inference() {
+        // 本地推理冷启动慢：总超时与首字看门狗都比云端放宽
+        assert!(Provider::Custom.request_timeout() > Provider::DashScope.request_timeout());
+        assert!(Provider::Custom.first_token_timeout() > Provider::DashScope.first_token_timeout());
     }
 
     #[test]

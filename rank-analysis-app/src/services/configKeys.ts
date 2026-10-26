@@ -23,6 +23,12 @@ export const CONFIG_KEYS = {
   aiProvider: 'aiProvider',
   /** 用户自带 Anthropic API Key（留空用中转内置的官方 key；不上云） */
   anthropicApiKey: 'anthropicApiKey',
+  /** 自定义 OpenAI 兼容 API 地址（provider=custom 时必填，填到 /v1 即可，后端自动补全路径） */
+  customBaseUrl: 'customBaseUrl',
+  /** 自定义端点的 API Key（provider=custom 时必填，Bearer 鉴权） */
+  customApiKey: 'customApiKey',
+  /** 自定义端点的模型名（provider=custom 时必填，如 gpt-4o / deepseek-v3） */
+  customModel: 'customModel',
   /** 玩家备注是否随 AI 分析请求发送到云端模型（默认开） */
   aiUsePlayerNotes: 'aiUsePlayerNotes',
   /** 云同步开关（默认关，开启需经风险告知弹窗） */
